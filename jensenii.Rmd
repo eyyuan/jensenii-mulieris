@@ -1,0 +1,645 @@
+---
+title: "Jensenii-Mulieris Analysis"
+author: "Erin Yuan"
+date: "2022-10-25"
+output: html_document
+---
+
+This Rmd file takes raw counts of SGBs, converts counts to proportions using a correction factor for scaling, and visualizes them using stacked bar plots. 
+
+```{r setup, warning = F}
+# install packages
+# install.packages("ggplot2")
+# install.packages("reshape2")
+# install.packages("ape")
+# install.packages("dplyr")
+# install.packages("vegan")
+# install.packages("pheatmap")
+# install.packages("cowplot")
+# install.packages("devtools")
+# devtools::install_github("jaredhuling/jcolors")
+# install.packages("viridis)
+
+# load packages
+library(ggplot2)
+library(reshape2)
+library(ape)
+library(dplyr)
+library(vegan)
+library(pheatmap)
+library(cowplot)
+library(jcolors)
+library(viridis)
+```
+
+# Data cleaning
+```{r}
+# load data
+counts <- read.table("data/SGB_read_counts_NorthAmerican_26July2021.tab", sep = "\t", check.names = T, header = T, row.names = 1) # rows = samples, cols = SGBs
+correction <- read.table("data/correction_factor_8July2021.tab", sep = "\t", check.names = T, header = F, row.names = NULL) # rows = SGB names, col = correction factor 
+metadata <- read.table("data/combined_metadata_with_VIRGO_5_Nov_2020.tab", sep = "\t", check.names = T, header = T, row.names = 1) # rows = samples, cols = age, ethnicity, status, country, study 
+
+## preprocessing for counts
+# shift the column names to the left 
+counts_fixed = counts[,-c(337)] # 337 = total number of columns  
+counts_fixed = counts_fixed[,c(-1)]
+colnames(counts_fixed) = colnames(counts)[seq(3,length(counts[1,]))]
+counts_fixed <- counts_fixed[, 1:335] # rows = samples, cols = SGBs
+
+# delete row with sample CM_G1-2_MERGE because there is no metadata associated with it  
+delete_row = which(rownames(counts_fixed) == "CM_G1-2_MERGE")
+counts_fixed = counts_fixed[c(-140), ]
+
+## metadata
+# delete the first row because it is empty and only includes the column header for SGBs
+metadata <- metadata[-1, ]
+
+# remove NAs for sample CM_G1-2_MERGE
+# metadata <- metadata %>%
+#   filter(!is.na(study))
+```
+
+Scaling SGB counts: make scaled counts using correction factor
+```{r}
+# merge correction with counts_fixed
+counts_t <- as.data.frame(t(counts_fixed)) # rows = SGBs, columns = samples 
+counts_t <- counts_t %>%
+  mutate(sgbs = rownames(counts_t))
+counts_correction_t <- left_join(counts_t, correction, by = c("sgbs" = "V1"))
+
+# remove SGBs with NA correction factor
+counts_correction_noNA_t <- counts_correction_t %>%
+  filter(!is.na(V2))
+print(paste0("# of SGBs removed bc NA correction factor: ", nrow(counts_correction_t) - nrow(counts_correction_noNA_t)))
+
+# multiply each row's entry by the correction factor 
+counts_corrected_t <- counts_correction_noNA_t
+for (row in 1:nrow(counts_corrected_t)) { # iterate over each row (sgb)
+  for (col in 1:(ncol(counts_corrected_t)-2)) {
+    counts_corrected_t[row, col] = counts_corrected_t[row, col] * counts_corrected_t[row, ncol(counts_corrected_t)]
+  }
+}
+
+# rename rownames to be sgbs
+sgbs <- counts_corrected_t[, ncol(counts_corrected_t)-1]  
+rownames(counts_corrected_t) = sgbs
+counts_corrected_t <- counts_corrected_t[, 1:(ncol(counts_corrected_t)-2)]
+counts_corrected <- as.data.frame(t(counts_corrected_t)) # rows = samples, cols = SGBs
+
+# find the total for a sample
+counts_total <- counts_corrected %>%
+  mutate(total = rowSums(counts_corrected))
+
+# remove 0s
+counts_nz_total <- counts_total[-which(rowSums(counts_total) == 0), ] # if sample (column) sums to 0, then remove
+
+# find proportions
+counts_prop <- counts_nz_total
+for (row in 1:nrow(counts_prop)) { # iterate over each row (sample)
+  for (col in 1:(ncol(counts_prop)-1)) {
+    counts_prop[row, col] = as.numeric(counts_prop[row, col] / counts_prop[row, ncol(counts_prop)])
+  }
+}
+counts_prop <- counts_prop[, 1:ncol(counts_prop)-1] # rows = samples, cols = SGBs
+
+# make correlation matrix 
+corr <- cor(counts_prop, method = "spearman")
+corr_jensenii <- corr[which(rownames(corr) %in% c("SGB14", "SGB156")), ]
+pheatmap(corr_jensenii)
+```
+
+Cutoff 
+```{r}
+# find SGBs that have correlation more than [cutoff]
+cutoff = 0.2
+above_cutoff = c() # create new vector to store names of SGBs that have correlation more than [cutoff]
+for (row in c(1, 2)) { 
+  for (col in 1:ncol(corr_jensenii)) {
+    if (corr_jensenii[row, col] > cutoff) {
+      above_cutoff <- c(above_cutoff, colnames(corr_jensenii)[col])
+    }
+  }
+}
+corr_jensenii_above_cutoff <- corr_jensenii[, which(colnames(corr_jensenii) %in% above_cutoff)]
+pheatmap(corr_jensenii_above_cutoff)
+```
+
+# Figure 2a: Stacked bars for samples vs. abundances of jensenii, not divided by study
+```{r}
+# find top [max] most abundant SGBs (sum of abundances is the highest)
+max = 10
+counts_prop_t <- as.data.frame(t(counts_prop)) 
+counts_prop_sum <- counts_prop_t %>%
+  mutate(sgbSum = rowSums(counts_prop_t)) %>% # create new col with row (sgb) sums across all samples 
+  arrange(desc(sgbSum)) %>% # arrange from highest to lowest sums
+  select(sgbSum) # view only sums
+top <- rownames(counts_prop_sum)[1:max] # select only top [max]
+# test: these two lines should match
+# top 
+# head(counts_prop_sum, n = 10)
+
+# limit to only samples that have SGB14 or SGB156 (jensenii)
+onlyJenseniiCutoff = 0.01 # remove samples < 1% of any jensenii
+counts_prop_jensenii <- counts_prop %>%
+  select(SGB14, SGB156)
+counts_prop_jensenii_above_cutoff <- counts_prop_jensenii %>%
+  mutate(sampleSumJensenii = rowSums(counts_prop_jensenii)) %>%
+  filter(sampleSumJensenii > onlyJenseniiCutoff)
+print(paste0("# of samples removed bc no jensenii: ", nrow(counts_prop_jensenii) - nrow(counts_prop_jensenii_above_cutoff))) 
+samplesWithJensenii <- rownames(counts_prop_jensenii_above_cutoff)
+counts_prop_samplesWithJensenii <- counts_prop %>%
+  mutate(samples = rownames(counts_prop)) %>%
+  filter(samples %in% samplesWithJensenii)
+print(paste0("# of samples removed bc no jensenii: ", nrow(counts_prop) - nrow(counts_prop_samplesWithJensenii))) 
+```
+
+ggplot
+```{r}
+# melt 
+counts_prop_melt <- melt(counts_prop_samplesWithJensenii, id.vars = "samples", variable.name = "sgb", value.name = "percentage")
+
+# create new label for top10 and SGB14 and SGB156 (jensenii) 
+counts_prop_jensenii_melt <- counts_prop_melt %>%
+  mutate(label = ifelse(sgb %in% c("SGB14", "SGB156", top), as.character(sgb), "Other"))
+
+# create a factor for label
+counts_prop_jensenii_melt$label <- factor(counts_prop_jensenii_melt$label, levels = c("SGB156", "SGB14", "SGB164", "SGB58", "SGB59", "SGB118", "SGB91", "SGB359", "SGB227", "SGB144", "Other"))
+
+# reorder the x-axis (samples) 
+counts_prop_jensenii_SGB14 <- counts_prop_jensenii_melt %>% # make new data frame of only SGB14
+  filter(sgb == "SGB14") %>%
+  select(-sgb)
+counts_prop_jensenii_order <- counts_prop_jensenii_above_cutoff %>%
+  mutate(SGB156_ordered = ifelse(SGB14 > SGB156, 0, as.numeric(SGB156))) %>%
+  select(SGB156_ordered)
+counts_prop_jensenii_melt$samples <- factor(counts_prop_jensenii_melt$samples, levels = counts_prop_jensenii_melt$samples[order(-counts_prop_jensenii_order$SGB156_ordered, counts_prop_jensenii_SGB14$percentage)]) # ordered by SGB156 then SGB14
+
+# plot
+n_abundance = nrow(counts_prop_jensenii_above_cutoff)
+sgb_abundances = ggplot(data = counts_prop_jensenii_melt, mapping = aes(x = samples, y = percentage)) +
+  geom_col(aes(fill = label)) + 
+  labs( # title = "Jensenii Figure 2a Top", 
+       x = "Samples", 
+       y = "Relative Abundance", 
+       # caption = paste0("n = ", n_abundance)
+       ) +  
+  theme_minimal() + 
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank()) +
+  scale_fill_jcolors(palette = "pal8")
+sgb_abundances
+# ggsave("figures/jensenii_figure2a_top.pdf")
+```
+
+# Figure 2a strips
+Stacked bars for samples vs. abundances for jensenii
+```{r}
+# recalculate proportions for only SGB14 and SGB156 (jensenii)
+counts_prop_jensenii_only <- counts_prop_jensenii_above_cutoff
+for (row in 1:nrow(counts_prop_jensenii_only)) { # iterate over each row (sample)
+  for (col in 1:(ncol(counts_prop_jensenii_only)-1)) { 
+    counts_prop_jensenii_only[row, col] = as.numeric(counts_prop_jensenii_only[row, col] / counts_prop_jensenii_only[row, ncol(counts_prop_jensenii_only)])
+  }
+}
+counts_prop_jensenii_only <- counts_prop_jensenii_only[, 1:ncol(counts_prop_jensenii_only)-1] # rows = samples, cols = SGBs 
+counts_prop_jensenii_only_samples <- counts_prop_jensenii_only %>%
+  mutate(samples = rownames(counts_prop_jensenii_only))
+```
+
+ggplot
+```{r}
+# melt 
+counts_prop_jensenii_only_melt <- melt(counts_prop_jensenii_only_samples, id.vars = "samples", variable.name = "sgb", value.name = "percentage")
+
+# change order of factor for sgb
+counts_prop_jensenii_only_melt$sgb <- factor(counts_prop_jensenii_only_melt$sgb, levels = c("SGB156", "SGB14"))
+
+# reorder by the SAME ORDER as the above plot
+counts_prop_jensenii_only_melt$samples <- factor(counts_prop_jensenii_only_melt$samples, levels = counts_prop_jensenii_only_melt$samples[order(-counts_prop_jensenii_order$SGB156_ordered, counts_prop_jensenii_SGB14$percentage)]) # ordered by SGB156 then SGB14
+
+# plot
+jensenii_ratios = ggplot(data = counts_prop_jensenii_only_melt, mapping = aes(x = samples, y = percentage)) +
+  geom_col(aes(fill = sgb)) + 
+  labs( # title = "Jensenii Figure 2a Ratio", 
+       x = "Samples", 
+       y = "Relative Abundance", 
+       # caption = paste0("n = ", n_abundance)
+       ) +  
+  scale_fill_jcolors(palette = "pal8") + 
+  theme_minimal() + 
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.y=element_blank()) 
+jensenii_ratios
+# ggsave("figures/jensenii_figure2a_ratio_legend.pdf")
+```
+
+```{r}
+# find number of 100% SGB14, 100% SGB156, and both
+counts_prop_jensenii_allSGB14 <- counts_prop_jensenii_only %>%
+  filter(SGB14 > 0.99)
+print(paste0("# of samples with only L. jensenii: ", nrow(counts_prop_jensenii_allSGB14)))
+counts_prop_jensenii_allSGB156 <- counts_prop_jensenii_only %>%
+  filter(SGB156 > 0.99)
+print(paste0("# of samples with only L. mulieris: ", nrow(counts_prop_jensenii_allSGB156)))
+print(paste0("# of samples with both L. jensenii and L. mulieris: ", nrow(counts_prop_jensenii_only)-nrow(counts_prop_jensenii_allSGB14)-nrow(counts_prop_jensenii_allSGB156)))
+```
+
+Metadata strips
+```{r}
+metadata_samples <- metadata %>%
+  mutate(samples = rownames(metadata)) %>% # add sample names as a column
+  mutate(stat = 1) %>% # add column called stat = 1
+  select(-country, -age) # remove country column bc all from NAm, remove age bc not relevant
+counts_prop_jensenii_above_cutoff_samples <- counts_prop_jensenii_above_cutoff %>%
+  mutate(samples = rownames(counts_prop_jensenii_above_cutoff))
+
+# merge metadata with proportions of jensenii only
+samples_with_metadata <- left_join(counts_prop_jensenii_above_cutoff_samples, metadata_samples) %>%
+  select(-SGB14, -SGB156, -sampleSumJensenii) %>%
+  mutate(samples = rownames(counts_prop_jensenii_above_cutoff_samples))
+```
+
+1. by study
+```{r}
+strip_study_data <- samples_with_metadata %>%
+  select(samples, study, stat)
+
+# reorder 
+strip_study_data$samples <- factor(strip_study_data$samples, levels = strip_study_data$samples[order(-counts_prop_jensenii_order$SGB156_ordered, counts_prop_jensenii_SGB14$percentage)])
+
+# plot
+strip_study_plot = ggplot(data = strip_study_data, aes(x = samples, y = stat, fill = study)) + 
+  geom_tile(colour="white",size=0.25) + 
+  labs(# title = "Study", 
+       # caption = paste0("n = ", n_abundance)
+      ) + 
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),  
+        axis.title.x=element_blank(),  
+        axis.title.y= element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(), 
+        axis.line=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        text = element_text(size=9)) + 
+  scale_fill_viridis(discrete = TRUE, option = "C")
+strip_study_plot
+# ggsave("figures/jensenii_figure2a_study_legend.pdf")
+```
+
+2. by reproductive status
+```{r}
+strip_reprod_data <- samples_with_metadata %>%
+  select(samples, status, stat)
+
+# reorder 
+strip_reprod_data$samples <- factor(strip_reprod_data$samples, levels = strip_reprod_data$samples[order(-counts_prop_jensenii_order$SGB156_ordered, counts_prop_jensenii_SGB14$percentage)])
+
+# plot
+strip_reprod_plot = ggplot(data = strip_reprod_data, aes(x = samples, y = stat, fill = status)) + 
+  geom_tile(colour="white",size=0.25) + 
+  labs(# title = "Reproductive Status", 
+       # caption = paste0("n = ", n_abundance)
+      ) + 
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),  
+        axis.title.x=element_blank(),  
+        axis.title.y= element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(), 
+        axis.line=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        text = element_text(size=9)) + 
+  scale_fill_viridis(discrete = TRUE)
+strip_reprod_plot
+# ggsave("figures/jensenii_figure2a_status_legend.pdf")
+```
+
+3. by ethnicity
+```{r}
+strip_ethnicity_data <- samples_with_metadata %>%
+  select(samples, ethnicity, stat)
+
+# reorder 
+strip_ethnicity_data$samples <- factor(strip_ethnicity_data$samples, levels = strip_ethnicity_data$samples[order(-counts_prop_jensenii_order$SGB156_ordered, counts_prop_jensenii_SGB14$percentage)])
+
+# plot
+cols <- c("AA" = "red", "Pac" = "blue", "W" = "darkgreen", "na" = "gray")
+strip_ethnicity_plot = ggplot(data = strip_ethnicity_data, aes(x = samples, y = stat, fill = ethnicity)) + 
+  geom_tile(colour="white",size=0.25) + 
+  labs(# title = "Ethnicity", 
+       # caption = paste0("n = ", n_abundance)
+       ) + 
+  theme(legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),  
+        axis.title.x=element_blank(),  
+        axis.title.y= element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(), 
+        axis.line=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        text = element_text(size=9)) +
+  scale_fill_manual(values = cols)
+strip_ethnicity_plot
+# ggsave("figures/jensenii_figure2a_ethnicity_legend.pdf")
+```
+
+Cowplot
+```{r, fig.width = 5}
+plot_grid(sgb_abundances, jensenii_ratios, strip_study_plot, strip_reprod_plot, strip_ethnicity_plot, align = "v", ncol = 1, rel_heights = c(7, 1, 0.5, 0.5, 0.5))
+ggsave("figures/jensenii_figure2a.pdf")
+```
+
+# Supplemental Figure X
+```{r}
+# create new dataframe with presence/absence information
+presentDefinition = 0.01
+counts_prop_jensenii_presence <- counts_prop_jensenii %>% 
+  mutate(SGB14_present = ifelse(SGB14 > presentDefinition, "Yes", "No")) %>%
+  mutate(SGB156_present = ifelse(SGB156 > presentDefinition, "Yes", "No")) %>%
+  select(SGB14_present, SGB156_present) %>%
+  mutate(samples = rownames(counts_prop_jensenii))
+
+# merge with metadata
+presence_metadata <- left_join(counts_prop_jensenii_presence, metadata_samples)
+```
+
+```{r}
+# create 3 new dataframes for each feature
+
+# study
+presence_metadata_study_SGB14 <- presence_metadata %>%
+  select(samples, SGB14_present, study, -stat) %>%
+  group_by(study, SGB14_present) %>%
+  summarise(counts = n()) %>%
+  mutate(prop = counts / sum(counts)) %>%
+  filter(SGB14_present == "Yes") %>%
+  rename(sgb = SGB14_present) %>%
+  mutate(sgb = recode(sgb, "Yes" = "SGB14"))
+presence_metadata_study_SGB156 <- presence_metadata %>%
+  select(samples, SGB156_present, study, -stat) %>%
+  group_by(study, SGB156_present) %>%
+  summarise(counts = n()) %>%
+  mutate(prop = counts / sum(counts)) %>%
+  filter(SGB156_present == "Yes") %>%
+  rename(sgb = SGB156_present) %>%
+  mutate(sgb = recode(sgb, "Yes" = "SGB156"))
+presence_metadata_study <- rbind (presence_metadata_study_SGB14, presence_metadata_study_SGB156)
+presence_metadata_study$sgb <- factor(presence_metadata_study$sgb, levels = c("SGB14", "SGB156")) # change order of factor for sgb
+
+# reproductive status
+presence_metadata_reprod_SGB14 <- presence_metadata %>%
+  select(samples, SGB14_present, status, -stat) %>%
+  group_by(status, SGB14_present) %>%
+  summarise(counts = n()) %>%
+  mutate(prop = counts / sum(counts)) %>%
+  filter(SGB14_present == "Yes") %>%
+  rename(sgb = SGB14_present) %>%
+  mutate(sgb = recode(sgb, "Yes" = "SGB14"))
+presence_metadata_reprod_SGB156 <- presence_metadata %>%
+  select(samples, SGB156_present, status, -stat) %>%
+  group_by(status, SGB156_present) %>%
+  summarise(counts = n()) %>%
+  mutate(prop = counts / sum(counts)) %>%
+  filter(SGB156_present == "Yes") %>%
+  rename(sgb = SGB156_present) %>%
+  mutate(sgb = recode(sgb, "Yes" = "SGB156"))
+presence_metadata_reprod <- rbind (presence_metadata_reprod_SGB14, presence_metadata_reprod_SGB156)
+presence_metadata_reprod$sgb <- factor(presence_metadata_reprod$sgb, levels = c("SGB14", "SGB156")) # change order of factor for sgb
+
+# ethnicity
+presence_metadata_ethnicity_SGB14 <- presence_metadata %>%
+  select(samples, SGB14_present, ethnicity, -stat) %>%
+  group_by(ethnicity, SGB14_present) %>%
+  summarise(counts = n()) %>% 
+  ungroup() %>%
+  add_row(ethnicity = "As", SGB14_present = "Yes", counts = 0) %>%
+  add_row(ethnicity = "H", SGB14_present = "Yes", counts = 0) %>%
+  add_row(ethnicity = "Other", SGB14_present = "Yes", counts = 0) %>%
+  add_row(ethnicity = "Pac", SGB14_present = "Yes", counts = 0) %>%
+  group_by(ethnicity) %>%
+  mutate(prop = counts / sum(counts)) %>%
+  filter(SGB14_present == "Yes") %>%
+  rename(sgb = SGB14_present) %>%
+  mutate(sgb = recode(sgb, "Yes" = "SGB14"))
+presence_metadata_ethnicity_SGB156 <- presence_metadata %>%
+  select(samples, SGB156_present, ethnicity, -stat) %>%
+  group_by(ethnicity, SGB156_present) %>%
+  summarise(counts = n()) %>%
+  ungroup() %>%
+  add_row(ethnicity = "As", SGB156_present = "Yes", counts = 0) %>%
+  add_row(ethnicity = "H", SGB156_present = "Yes", counts = 0) %>%
+  add_row(ethnicity = "Other", SGB156_present = "Yes", counts = 0) %>%
+  group_by(ethnicity) %>%
+  mutate(prop = counts / sum(counts)) %>%
+  filter(SGB156_present == "Yes") %>%
+  rename(sgb = SGB156_present) %>%
+  mutate(sgb = recode(sgb, "Yes" = "SGB156"))
+presence_metadata_ethnicity <- rbind (presence_metadata_ethnicity_SGB14, presence_metadata_ethnicity_SGB156)
+presence_metadata_ethnicity$sgb <- factor(presence_metadata_ethnicity$sgb, levels = c("SGB14", "SGB156")) # change order of factor for sgb
+
+# set color limits for heatmap
+rng = range(presence_metadata_study$prop, presence_metadata_reprod$prop, presence_metadata_ethnicity$prop)
+```
+
+ggplots
+1. by study
+```{r}
+# plot
+ggplot(data = presence_metadata_study, aes(x = study, y = sgb, fill = prop)) + 
+  geom_tile(colour="black",size=0.25) + 
+  labs(# title = "Study", 
+       # caption = paste0("n = ", n)
+       ) + 
+  theme(# legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),  
+        # axis.title.x=element_blank(),  
+        axis.title.y= element_blank(), 
+        axis.line=element_blank(),
+        # axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        text = element_text(size=9)) + 
+  scale_fill_gradient2(# low="purple", high="yellow", 
+               # midpoint=mean(rng),    
+               # breaks=seq(0,1,0.25), #breaks in the scale bar
+               limits=c(floor(rng[1]), ceiling(rng[2])))
+ggsave("figures/jensenii_supplemental_figure_study_legend.pdf")
+```
+
+2. by reproductive status 
+```{r}
+ggplot(data = presence_metadata_reprod, aes(x = status, y = sgb, fill = prop)) + 
+  geom_tile(colour="black",size=0.25) + 
+  labs(# title = "Reproductive Status", 
+       # caption = paste0("n = ", n)
+       ) + 
+  theme(# legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),  
+        # axis.title.x=element_blank(),  
+        axis.title.y= element_blank(), 
+        axis.line=element_blank(),
+        # axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        text = element_text(size=9)) +
+   scale_fill_gradient2(# low="purple", high="yellow", 
+               # midpoint=mean(rng),    
+               # breaks=seq(0,1,0.25), #breaks in the scale bar
+               limits=c(floor(rng[1]), ceiling(rng[2])))
+ggsave("figures/jensenii_supplemental_figure_reprod_legend.pdf")
+```
+
+3. by ethnicity
+```{r}
+ggplot(data = presence_metadata_ethnicity, aes(x = ethnicity, y = sgb, fill = prop)) + 
+  geom_tile(colour="black",size=0.25) + 
+  labs(# title = "Ethnicity", 
+       # caption = paste0("n = ", n)
+       ) + 
+  theme(# legend.position = "none", 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),  
+        # axis.title.x=element_blank(),  
+        axis.title.y= element_blank(), 
+        axis.line=element_blank(),
+        # axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        text = element_text(size=9)) + 
+   scale_fill_gradient2(# low="purple", high="yellow", 
+               # midpoint=mean(rng),    
+               # breaks=seq(0,1,0.25), #breaks in the scale bar
+               limits=c(floor(rng[1]), ceiling(rng[2])))
+ggsave("figures/jensenii_supplemental_figure_ethnicity_legend.pdf")
+```
+
+# Extra: Stacked bars divided by study 
+```{r}
+# make 3 separate dataframes for 3 separate studies
+counts_metadata_hmp_melt <- counts_metadata_jensenii_melt %>%
+  filter(study == "HMP")
+counts_metadata_msflash_melt <- counts_metadata_jensenii_melt %>%
+  filter(study == "MsFlash") 
+counts_metadata_relman_melt <- counts_metadata_jensenii_melt %>%
+  filter(study == "Relman")
+```
+
+ggplots
+1. HMP
+```{r}
+# find number of samples
+counts_metadata_hmp_melt_unique <- counts_metadata_hmp_melt %>%
+  select(samples) %>%
+  distinct()
+n_hmp = nrow(counts_metadata_hmp_melt_unique)
+
+# reorder the x-axis (samples) 
+counts_metadata_hmp_melt_SGB14 <- counts_metadata_hmp_melt %>% # make new data frame of only SGB14
+  filter(sgb == "SGB14") %>%
+  select(-sgb)
+counts_metadata_hmp_melt_SGB156 <- counts_metadata_hmp_melt %>% # make new data frame of only SGB156
+  filter(sgb == "SGB156") %>%
+  select(-sgb)
+counts_metadata_hmp_melt$samples <- factor(counts_metadata_hmp_melt$samples, levels = counts_metadata_hmp_melt$samples[order(-counts_metadata_hmp_melt_SGB14$percentage, counts_metadata_hmp_melt_SGB156$percentage)])
+
+# plot
+ggplot(data = counts_metadata_hmp_melt, mapping = aes(x = samples, y = percentage)) +
+  geom_col(aes(fill = label)) + 
+  labs(title = "Jensenii Figure 2b HMP", 
+       x = "Samples", 
+       y = "Relative Abundance", 
+       caption = paste0("n = ", n_hmp)) +  
+  scale_fill_discrete(name = "SGBs") + 
+  theme_minimal() + 
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) 
+# ggsave("jensenii_figure2b_hmp.pdf")
+```
+
+2. MsFlash
+```{r}
+# find number of samples
+counts_metadata_msflash_melt_unique <- counts_metadata_msflash_melt %>%
+  select(samples) %>%
+  distinct()
+n_msflash = nrow(counts_metadata_msflash_melt_unique)
+
+# reorder the x-axis (samples) 
+counts_metadata_msflash_melt_SGB14 <- counts_metadata_msflash_melt %>% # make new data frame of only SGB14
+  filter(sgb == "SGB14") %>%
+  select(-sgb)
+counts_metadata_msflash_melt_SGB156 <- counts_metadata_msflash_melt %>% # make new data frame of only SGB156
+  filter(sgb == "SGB156") %>%
+  select(-sgb)
+counts_metadata_msflash_melt$samples <- factor(counts_metadata_msflash_melt$samples, levels = counts_metadata_msflash_melt$samples[order(-counts_metadata_msflash_melt_SGB14$percentage, counts_metadata_msflash_melt_SGB156$percentage)])
+
+# plot
+ggplot(data = counts_metadata_msflash_melt, mapping = aes(x = samples, y = percentage)) +
+  geom_col(aes(fill = label)) + 
+  labs(title = "Jensenii Figure 2b MsFlash", 
+       x = "Samples", 
+       y = "Relative Abundance", 
+       caption = paste0("n = ", n_msflash)) +  
+  scale_fill_discrete(name = "SGBs") + 
+  theme_minimal() + 
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) 
+# ggsave("jensenii_figure2b_msflash.pdf")
+```
+
+3. Relman
+```{r}
+# find number of samples
+counts_metadata_relman_melt_unique <- counts_metadata_relman_melt %>%
+  select(samples) %>%
+  distinct()
+n_relman = nrow(counts_metadata_relman_melt_unique)
+
+# reorder the x-axis (samples) 
+counts_metadata_relman_melt_SGB14 <- counts_metadata_relman_melt %>% # make new data frame of only SGB14
+  filter(sgb == "SGB14") %>%
+  select(-sgb)
+counts_metadata_relman_melt_SGB156 <- counts_metadata_relman_melt %>% # make new data frame of only SGB156
+  filter(sgb == "SGB156") %>%
+  select(-sgb)
+counts_metadata_relman_melt$samples <- factor(counts_metadata_relman_melt$samples, levels = counts_metadata_relman_melt$samples[order(-counts_metadata_relman_melt_SGB14$percentage, counts_metadata_relman_melt_SGB156$percentage)])
+
+# plot
+ggplot(data = counts_metadata_relman_melt, mapping = aes(x = samples, y = percentage)) +
+  geom_col(aes(fill = label)) + 
+  labs(title = "Jensenii Figure 2b Relman", 
+       x = "Samples", 
+       y = "Relative Abundance", 
+       caption = paste0("n = ", n_relman)) +  
+  scale_fill_discrete(name = "SGBs") + 
+  theme_minimal() + 
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) 
+# ggsave("jensenii_figure2b_relman.pdf")
+```
